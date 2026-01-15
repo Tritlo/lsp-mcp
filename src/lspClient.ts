@@ -56,12 +56,14 @@ export class LSPClient {
 
     // Process complete messages
     while (true) {
-      // Look for the standard LSP header format - this captures the entire header including the \r\n\r\n
-      const headerMatch = this.buffer.match(/^Content-Length: (\d+)\r\n\r\n/);
+      // Look for Content-Length header and capture all headers before the empty line
+      // This handles cases where there are other headers like Content-Type before Content-Length
+      const headerMatch = this.buffer.match(/((?:.*\r?\n)*Content-Length: (\d+)\r?\n\r?\n)/);
       if (!headerMatch) break;
 
-      const contentLength = parseInt(headerMatch[1], 10);
-      const headerEnd = headerMatch[0].length;
+      const fullHeader = headerMatch[1];
+      const contentLength = parseInt(headerMatch[2], 10);
+      const headerEnd = fullHeader.length;
 
       // Prevent processing unreasonably large messages
       if (contentLength > MAX_BUFFER_SIZE) {
@@ -73,10 +75,10 @@ export class LSPClient {
       // Check if we have the complete message (excluding the header)
       if (this.buffer.length < headerEnd + contentLength) break; // Message not complete yet
 
-      // Extract the message content - using exact content length without including the header
+      // Extract the message content - starting after the complete header block
       let content = this.buffer.substring(headerEnd, headerEnd + contentLength);
       // Make the parsing more robust by ensuring content ends with a closing brace
-      if (content[content.length - 1] !== '}') {
+      if (content.length === 0 || content[content.length - 1] !== '}') {
         debug("Content doesn't end with '}', adjusting...");
         const lastBraceIndex = content.lastIndexOf('}');
         if (lastBraceIndex !== -1) {
@@ -263,7 +265,7 @@ export class LSPClient {
   private sendNotification(method: string, params?: any): void {
     // Check if the process is started
     if (!this.process) {
-      console.error("LSP process not started. Please call start_lsp first.");
+      logError("LSP process not started. Please call start_lsp first.");
       return;
     }
 
