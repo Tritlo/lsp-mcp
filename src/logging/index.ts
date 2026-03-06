@@ -46,19 +46,18 @@ let isLogging = false;
 export const log = (level: LoggingLevel, ...args: any[]): void => {
   if (!shouldLog(level)) return;
 
-  const timestamp = new Date().toISOString();
   const message = args.map(arg =>
     typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
   ).join(' ');
 
-  // Format for console output with color coding
-  let consoleMethod = originalConsoleLog; // Use original methods to prevent recursion
+  // Always write server logs to stderr so stdout remains MCP-only JSON-RPC.
+  let consoleMethod = originalConsoleError;
   let consolePrefix = '';
 
   switch(level) {
     case 'debug':
       consolePrefix = '\x1b[90m[DEBUG]\x1b[0m'; // Gray
-      consoleMethod = originalConsoleWarn || originalConsoleLog;
+      consoleMethod = originalConsoleWarn || originalConsoleError;
       break;
     case 'info':
       consolePrefix = '\x1b[36m[INFO]\x1b[0m'; // Cyan
@@ -68,7 +67,7 @@ export const log = (level: LoggingLevel, ...args: any[]): void => {
       break;
     case 'warning':
       consolePrefix = '\x1b[33m[WARNING]\x1b[0m'; // Yellow
-      consoleMethod = originalConsoleWarn || originalConsoleLog;
+      consoleMethod = originalConsoleWarn || originalConsoleError;
       break;
     case 'error':
       consolePrefix = '\x1b[31m[ERROR]\x1b[0m'; // Red
@@ -90,8 +89,13 @@ export const log = (level: LoggingLevel, ...args: any[]): void => {
 
   consoleMethod(`${consolePrefix} ${message}`);
 
-  // Send notification to MCP client if server is available and initialized
-  if (serverInstance && typeof serverInstance.notification === 'function') {
+  // Emit MCP logging notifications only after initialize has completed.
+  const clientInitialized =
+    serverInstance &&
+    typeof serverInstance.getClientCapabilities === 'function' &&
+    !!serverInstance.getClientCapabilities();
+
+  if (clientInitialized && typeof serverInstance.notification === 'function') {
     try {
       serverInstance.notification({
         method: "notifications/message",
@@ -125,7 +129,7 @@ export const setLogLevel = (level: LoggingLevel): void => {
 
   // Always log this message regardless of the new log level
   // Use notice level to ensure it's visible
-  originalConsoleLog(`\x1b[32m[NOTICE]\x1b[0m Log level changed from ${oldLevel} to ${level}`);
+  originalConsoleError(`\x1b[32m[NOTICE]\x1b[0m Log level changed from ${oldLevel} to ${level}`);
 
   // Also log through standard channels
   log('notice', `Log level set to: ${level}`);
@@ -134,8 +138,8 @@ export const setLogLevel = (level: LoggingLevel): void => {
 // Override console methods to use our logging system
 console.log = function(...args) {
   if (isLogging) {
-    // Use original method to prevent recursion
-    originalConsoleLog(...args);
+    // Never write logger output to stdout.
+    originalConsoleError(...args);
     return;
   }
 
