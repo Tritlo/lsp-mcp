@@ -73,7 +73,7 @@ For the demo server:
 
 1. Clone this repository:
    ```
-   git clone https://github.com/your-username/lsp-mcp.git
+   git clone https://github.com/Tritlo/lsp-mcp.git
    cd lsp-mcp
    ```
 
