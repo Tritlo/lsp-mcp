@@ -14,9 +14,10 @@
     "build": "tsc",
     "prepare": "npm run build",
     "watch": "tsc --watch",
-    "test": "npm run test:typescript && npm run test:prompts",
+    "test": "npm run test:typescript && npm run test:prompts && npm run test:stdout-safety",
     "test:typescript": "node test/typescript-lsp.test.js",
-    "test:prompts": "node test/prompts.test.js"
+    "test:prompts": "node test/prompts.test.js",
+    "test:stdout-safety": "node test/stdout-safety.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.5.0",
