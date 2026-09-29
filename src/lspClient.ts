@@ -1,11 +1,24 @@
 import { spawn } from "child_process";
 import path from "path";
+import { fileURLToPath, pathToFileURL } from "url";
 import { LSPMessage, DiagnosticUpdateCallback, LoggingLevel } from "./types/index.js";
 import { debug, info, notice, warning, log, logError } from "./logging/index.js";
 
+// LSP servers differ in how they percent-encode file URIs (e.g. a space may come
+// back as %20 even if we sent it raw), so store and look up file URIs in one form.
+export const normalizeFileUri = (uri: string): string => {
+  if (!uri.startsWith("file:")) return uri;
+  try {
+    return pathToFileURL(fileURLToPath(uri)).href;
+  } catch {
+    return uri;
+  }
+};
+
 export class LSPClient {
   private process: any;
-  private buffer: string = "";
+  private buffer: Buffer = Buffer.alloc(0);
+  private bytesToSkip: number = 0;
   private messageQueue: LSPMessage[] = [];
   private nextId: number = 1;
   private responsePromises: Map<string | number, { resolve: Function; reject: Function }> = new Map();
@@ -28,74 +41,102 @@ export class LSPClient {
   private startProcess(): void {
     info(`Starting LSP client with binary: ${this.lspServerPath}`);
     info(`Using LSP server arguments: ${this.lspServerArgs.join(' ')}`);
-    this.process = spawn(this.lspServerPath, this.lspServerArgs, {
+    const proc = spawn(this.lspServerPath, this.lspServerArgs, {
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.process = proc;
 
-    // Set up event listeners
-    this.process.stdout.on("data", (data: Buffer) => this.handleData(data));
-    this.process.stderr.on("data", (data: Buffer) => {
+    // Set up event listeners. Events from a process we have since replaced
+    // (see restart) are ignored so they cannot touch the new connection.
+    proc.stdout.on("data", (data: Buffer) => {
+      if (this.process === proc) this.handleData(data);
+    });
+    proc.stderr.on("data", (data: Buffer) => {
       debug(`LSP Server Message: ${data.toString()}`);
     });
 
-    this.process.on("close", (code: number) => {
+    // Without these listeners a spawn failure (e.g. EACCES) or a write to a
+    // dead server (EPIPE) is an unhandled 'error' event and takes down the MCP server.
+    proc.on("error", (error: Error) => {
+      logError(`LSP server process error: ${error.message}`);
+      if (this.process !== proc) return;
+      this.process = null;
+      this.initialized = false;
+      this.rejectPendingRequests(new Error(`LSP server process error: ${error.message}`));
+    });
+    proc.stdin.on("error", (error: Error) => {
+      warning(`Error writing to LSP server: ${error.message}`);
+    });
+
+    proc.on("close", (code: number) => {
       notice(`LSP server process exited with code ${code}`);
+      if (this.process !== proc) return;
+      this.rejectPendingRequests(new Error(`LSP server process exited with code ${code}`));
     });
   }
 
-  private handleData(data: Buffer): void {
-    // Append new data to buffer
-    this.buffer += data.toString();
-
-    // Implement a safety limit to prevent excessive buffer growth
-    const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB limit
-    if (this.buffer.length > MAX_BUFFER_SIZE) {
-      logError(`Buffer size exceeded ${MAX_BUFFER_SIZE} bytes, clearing buffer to prevent memory issues`);
-      this.buffer = this.buffer.substring(this.buffer.length - MAX_BUFFER_SIZE);
+  private rejectPendingRequests(error: Error): void {
+    const pending = Array.from(this.responsePromises.values());
+    this.responsePromises.clear();
+    for (const { reject } of pending) {
+      reject(error);
     }
+  }
 
-    // Process complete messages
+  private handleData(data: Buffer): void {
+    // Content-Length counts bytes of UTF-8, so the buffer is kept as bytes and only
+    // each complete message body is decoded. Decoding chunk by chunk would split
+    // multi-byte characters, and measuring decoded text would miscount them.
+    this.buffer = this.buffer.length === 0 ? data : Buffer.concat([this.buffer, data]);
+
+    const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB limit
+
     while (true) {
-      // Look for the standard LSP header format - this captures the entire header including the \r\n\r\n
-      const headerMatch = this.buffer.match(/^Content-Length: (\d+)\r\n\r\n/);
-      if (!headerMatch) break;
+      // Drop the remainder of a message we decided to skip
+      if (this.bytesToSkip > 0) {
+        const n = Math.min(this.bytesToSkip, this.buffer.length);
+        this.buffer = this.buffer.subarray(n);
+        this.bytesToSkip -= n;
+        if (this.bytesToSkip > 0) break;
+      }
 
-      const contentLength = parseInt(headerMatch[1], 10);
-      const headerEnd = headerMatch[0].length;
+      const headerEnd = this.buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) {
+        if (this.buffer.length > MAX_BUFFER_SIZE) {
+          logError(`No LSP header found in ${this.buffer.length} bytes, clearing buffer`);
+          this.buffer = Buffer.alloc(0);
+        }
+        break;
+      }
+
+      // Headers are ASCII; Content-Type and other headers may appear in any order
+      const headers = this.buffer.subarray(0, headerEnd).toString("ascii").split("\r\n");
+      const lengthHeader = headers
+        .map(h => h.match(/^Content-Length:\s*(\d+)\s*$/i))
+        .find(m => m !== null);
+      const bodyStart = headerEnd + 4;
+
+      if (!lengthHeader) {
+        logError(`LSP message without Content-Length header: ${headers.join(" | ")}`);
+        this.buffer = this.buffer.subarray(bodyStart);
+        continue;
+      }
+
+      const contentLength = parseInt(lengthHeader[1], 10);
 
       // Prevent processing unreasonably large messages
       if (contentLength > MAX_BUFFER_SIZE) {
         logError(`Received message with content length ${contentLength} exceeds maximum size, skipping`);
-        this.buffer = this.buffer.substring(headerEnd + contentLength);
+        this.buffer = this.buffer.subarray(bodyStart);
+        this.bytesToSkip = contentLength;
         continue;
       }
 
       // Check if we have the complete message (excluding the header)
-      if (this.buffer.length < headerEnd + contentLength) break; // Message not complete yet
+      if (this.buffer.length < bodyStart + contentLength) break; // Message not complete yet
 
-      // Extract the message content - using exact content length without including the header
-      let content = this.buffer.substring(headerEnd, headerEnd + contentLength);
-      // Make the parsing more robust by ensuring content ends with a closing brace
-      if (content[content.length - 1] !== '}') {
-        debug("Content doesn't end with '}', adjusting...");
-        const lastBraceIndex = content.lastIndexOf('}');
-        if (lastBraceIndex !== -1) {
-          const actualContentLength = lastBraceIndex + 1;
-          debug(`Adjusted content length from ${contentLength} to ${actualContentLength}`);
-          content = content.substring(0, actualContentLength);
-          // Update buffer position based on actual content length
-          this.buffer = this.buffer.substring(headerEnd + actualContentLength);
-        } else {
-          debug("No closing brace found, using original content length");
-          // No closing brace found, use original approach
-          this.buffer = this.buffer.substring(headerEnd + contentLength);
-        }
-      } else {
-        debug("Content ends with '}', no adjustment needed");
-        // Content looks good, remove precisely this processed message from buffer
-        this.buffer = this.buffer.substring(headerEnd + contentLength);
-      }
-
+      const content = this.buffer.subarray(bodyStart, bodyStart + contentLength).toString("utf8");
+      this.buffer = this.buffer.subarray(bodyStart + contentLength);
 
       // Parse the message and add to queue
       try {
@@ -159,7 +200,8 @@ export class LSPClient {
     if ('method' in message && message.id === undefined) {
       // Handle diagnostic notifications
       if (message.method === 'textDocument/publishDiagnostics' && message.params) {
-        const { uri, diagnostics } = message.params;
+        const { diagnostics } = message.params;
+        const uri = typeof message.params.uri === "string" ? normalizeFileUri(message.params.uri) : undefined;
 
         if (uri && Array.isArray(diagnostics)) {
           const severity = diagnostics.length > 0 ?
@@ -304,7 +346,7 @@ export class LSPClient {
         clientInfo: {
           name: "lsp-mcp-server"
         },
-        rootUri: "file://" + path.resolve(rootDirectory),
+        rootUri: pathToFileURL(path.resolve(rootDirectory)).href,
         capabilities: {
           textDocument: {
             hover: {
@@ -587,6 +629,9 @@ export class LSPClient {
       }
     }
 
+    // Requests still waiting on the old process will never be answered
+    this.rejectPendingRequests(new Error("LSP server was restarted"));
+
     // Kill the process if it's still running
     if (this.process && !this.process.killed) {
       try {
@@ -598,7 +643,9 @@ export class LSPClient {
     }
 
     // Reset state
-    this.buffer = "";
+    this.process = null;
+    this.buffer = Buffer.alloc(0);
+    this.bytesToSkip = 0;
     this.messageQueue = [];
     this.nextId = 1;
     this.responsePromises.clear();

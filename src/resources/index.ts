@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { fileURLToPath } from "url";
 import { DiagnosticUpdateCallback, ResourceHandler, SubscriptionContext, SubscriptionHandler, UnsubscriptionHandler } from "../types/index.js";
 import { LSPClient } from "../lspClient.js";
 import { createFileUri, checkLspClientInitialized } from "../tools/index.js";
@@ -347,7 +348,7 @@ export const generateResourcesList = (lspClient: LSPClient | null) => {
   // For each open document, add resources
   lspClient.getOpenDocuments().forEach((uri: string) => {
     if (uri.startsWith('file://')) {
-      const filePath = uri.slice(7); // Remove 'file://' prefix
+      const filePath = fileURLToPath(uri);
       const fileName = path.basename(filePath);
 
       // Add diagnostics resource

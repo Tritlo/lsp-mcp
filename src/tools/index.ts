@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { pathToFileURL } from "url";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import {
@@ -21,7 +22,7 @@ import { activateExtension, deactivateExtension, listActiveExtensions } from "..
 
 // Create a file URI from a file path
 export const createFileUri = (filePath: string): string => {
-  return `file://${path.resolve(filePath)}`;
+  return pathToFileURL(path.resolve(filePath)).href;
 };
 
 // Check if LSP client is initialized
